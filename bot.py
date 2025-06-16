@@ -1,203 +1,151 @@
+@@ -0,0 +1,150 @@
 import discord
 import asyncio
-import requests
-import os
 import re
-
-# Read token from environment variable 'TOKEN' for Railway deployment
-token = os.getenv("TOKEN")
-if not token:
-    print("Error: TOKEN environment variable not found.")
-    exit(1)
+import os
 
 intents = discord.Intents.default()
-intents.messages = True  # message_content not available in v1.7.3
+intents.messages = True
+
 client = discord.Client(intents=intents)
 
-stream_text = "Streaming"
-command_prefix = "$"
-guild_rotation_task = None
-INTERVAL = 5  # default delay
+streaming_on = False
+stream_text = "Streaming now!"
+status_switching = False  # For compatibility, unused now
 
-DISCORD_API_URL = "https://discord.com/api/v9/users/@me/clan"
-
-# Load guilds from file
-def load_guilds():
-    path = "guild/guilds.txt"
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r") as f:
-        lines = [line.strip() for line in f if line.strip()]
-        return {f"Guild {i+1}": line for i, line in enumerate(lines)}
-
-def change_identity(guild_name, guild_id):
-    headers = {
-        "Authorization": token,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "identity_guild_id": guild_id,
-        "identity_enabled": True
-    }
-    try:
-        r = requests.put(DISCORD_API_URL, headers=headers, json=payload)
-        if r.status_code == 200:
-            print(f"[✓] Changed to: {guild_name}")
-        else:
-            print(f"[✗] {guild_name} failed: {r.status_code} - {r.text}")
-    except Exception as e:
-        print(f"[!] Error switching to {guild_name}: {e}")
-
-def parse_time_argument(arg):
-    match = re.match(r"(\d+)([smh])", arg)
-    if not match:
-        return None
-    val, unit = int(match.group(1)), match.group(2)
-    return val * {"s": 1, "m": 60, "h": 3600}[unit]
-
-async def rotate_guilds_dynamic(guild_map, interval):
-    items = list(guild_map.items())
-    total = len(items)
-    i = 0
-    while True:
-        name, gid = items[i]
-        change_identity(name, gid)
-        await asyncio.sleep(1 if i == 1 else interval)
-        i = (i + 1) % total
+auto_react_enabled = False
+auto_react_emoji = None
 
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user} (ID: {client.user.id})")
+    print(f'Logged in as {client.user} (ID: {client.user.id})')
+    print('------')
 
 @client.event
 async def on_message(message):
-    global stream_text, command_prefix
-    global guild_rotation_task, INTERVAL
-
-    if message.author.id != client.user.id:
-        return
+    global streaming_on, stream_text, auto_react_enabled, auto_react_emoji
 
     content = message.content.strip()
 
-    # --- Prefix ---
-    if content.startswith(command_prefix + "prefix set "):
-        command_prefix = content[len(command_prefix + "prefix set "):].strip()
-        await message.channel.send(f"```Prefix changed to: {command_prefix}```")
+    # React to every message including own messages if autoreact enabled
+    if auto_react_enabled and auto_react_emoji:
+        try:
+            await message.add_reaction(auto_react_emoji)
+        except Exception as e:
+            print(f"Failed to react: {e}")
+
+    # Only process commands from self (selfbot commands)
+    if message.author != client.user:
         return
 
-    if content == command_prefix + "prefix reset":
-        command_prefix = "$"
-        await message.channel.send("```Prefix reset to: $```")
-        return
-
-    # --- Streamer ---
-    if content == command_prefix + "streamer":
-        await client.change_presence(activity=discord.Streaming(name=stream_text, url="https://twitch.tv/?"))
-        await message.channel.send(f"```Streaming status set to: {stream_text}```")
-        return
-
-    if content == command_prefix + "streameroff":
-        await client.change_presence(activity=None)
-        await message.channel.send("```Streaming status cleared.```")
-        return
-
-    if content.startswith(command_prefix + "streamer text "):
-        stream_text = content[len(command_prefix + "streamer text "):].strip()
-        await message.channel.send(f"```Stream text set to: {stream_text}```")
-        return
-
-    # --- Guild Rotation ---
-    if content.startswith(command_prefix + "guild rotate"):
-        parts = content.split(maxsplit=3)
-        if len(parts) >= 3:
-            interval = parse_time_argument(parts[2])
-            if interval is None:
-                await message.channel.send("```Invalid time format. Use like 5s, 1m, or 2h.```")
-                return
-            INTERVAL = interval
-        else:
-            INTERVAL = 5
-
-        # Handle optional custom guild list
-        guild_map = {}
-        if len(parts) == 4:
-            raw_ids = parts[3].replace(",", " ").split()
-            for i, gid in enumerate(raw_ids):
-                gid = gid.strip()
-                if gid.isdigit():
-                    guild_map[f"Guild {i+1}"] = gid
-                else:
-                    await message.channel.send("```All guild IDs must be numeric.```")
-                    return
-        else:
-            guild_map = load_guilds()
-            if not guild_map:
-                await message.channel.send("```No guilds found in guild/guilds.txt```")
-                return
-
-        if guild_rotation_task is None:
-            guild_rotation_task = asyncio.create_task(rotate_guilds_dynamic(guild_map, INTERVAL))
-            await message.channel.send(f"```Guild rotation started (every {INTERVAL} sec).```")
-        else:
-            await message.channel.send("```Guild rotation is already running.```")
-        return
-
-    if content == command_prefix + "guild reset":
-        if guild_rotation_task:
-            guild_rotation_task.cancel()
-            guild_rotation_task = None
-            await message.channel.send("```Guild rotation stopped.```")
-        else:
-            await message.channel.send("```Guild rotation is not running.```")
-        return
-
-    # --- Purge ---
-    if content.startswith(command_prefix + "purge"):
-        parts = content.split()
-        if len(parts) != 2 or not parts[1].isdigit():
-            await message.channel.send("```Usage: purge <amount>```")
+    # $streamer - turn on streaming presence with current stream_text
+    if content == '$streamer':
+        if streaming_on:
+            await message.channel.send('`Streaming presence is already ON.`')
             return
-        limit = int(parts[1])
-        deleted = 0
-        async for msg in message.channel.history(limit=1000):
-            if msg.author.id == client.user.id:
-                await msg.delete()
-                deleted += 1
-                if deleted >= limit:
-                    break
-        await message.channel.send(f"```Purged {deleted} messages.```")
+        streaming_on = True
+        try:
+            await client.change_presence(activity=discord.Streaming(name=stream_text, url="https://twitch.tv/example"))
+            await message.channel.send('`Streaming presence turned ON.`')
+        except Exception as e:
+            await message.channel.send(f'`Error turning streaming ON: {e}`')
         return
 
-    # --- Help Menus ---
-    if content == command_prefix + "help":
-        with open("assets/help.txt", "r", encoding="utf-8") as f:
-            help_text = f.read()
-        await message.channel.send(f"`What was said?`\n```\n{help_text}\n```")
+    # $streameroff - turn off streaming presence (clear presence)
+    if content == '$streameroff':
+        if not streaming_on:
+            await message.channel.send('`Streaming presence is already OFF.`')
+            return
+        streaming_on = False
+        try:
+            await client.change_presence(activity=None)
+            await message.channel.send('`Streaming presence turned OFF.`')
+        except Exception as e:
+            await message.channel.send(f'`Error turning streaming OFF: {e}`')
         return
 
-    if content == command_prefix + "help streamer":
-        with open("assets/streamer.txt", "r", encoding="utf-8") as f:
-            text = f.read()
-        await message.channel.send(f"```\n{text}\n```")
+    # $streamertext <text> - change streaming status text if streaming is ON
+    if content.startswith('$streamertext '):
+        if not streaming_on:
+            await message.channel.send('`Streaming presence is OFF. Use $streamer first.`')
+            return
+        new_text = content[len('$streamertext '):].strip()
+        if not new_text:
+            await message.channel.send('`Error: No streaming text provided.`')
+            return
+        stream_text = new_text
+        try:
+            await client.change_presence(activity=discord.Streaming(name=stream_text, url="https://twitch.tv/example"))
+            await message.channel.send(f'`Streaming text updated to: {stream_text}`')
+        except Exception as e:
+            await message.channel.send(f'`Error updating streaming text: {e}`')
         return
 
-    if content == command_prefix + "help prefix":
-        with open("assets/prefix.txt", "r", encoding="utf-8") as f:
-            text = f.read()
-        await message.channel.send(f"```\n{text}\n```")
+    # $autoreact :emoji:
+    if content.startswith('$autoreact '):
+        emoji_str = content[len('$autoreact '):].strip()
+        if not emoji_str:
+            await message.channel.send('`Error: No emoji provided.`')
+            return
+
+        # Try adding reaction to check if valid emoji
+        try:
+            await message.add_reaction(emoji_str)
+        except Exception as e:
+            await message.channel.send(f'`Error: Invalid emoji or cannot use emoji: {e}`')
+            return
+
+        auto_react_enabled = True
+        auto_react_emoji = emoji_str
+        await message.channel.send(f'`Auto-react enabled with emoji: {auto_react_emoji}`')
         return
 
-    if content == command_prefix + "help guild":
-        with open("assets/guild.txt", "r", encoding="utf-8") as f:
-            text = f.read()
-        await message.channel.send(f"```\n{text}\n```")
+    # $autoreactoff
+    if content == '$autoreactoff':
+        if auto_react_enabled:
+            auto_react_enabled = False
+            auto_react_emoji = None
+            await message.channel.send('`Auto-react disabled.`')
+        else:
+            await message.channel.send('`Auto-react is not enabled.`')
         return
 
-    if content == command_prefix + "help purge":
-        with open("assets/purge.txt", "r", encoding="utf-8") as f:
-            text = f.read()
-        await message.channel.send(f"```\n{text}\n```")
-        return
+    # $help
+    if content == '$help':
+        await message.channel.send('`Welcome To My Wrath`')
+        help_text = """\
+⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⡀⣰⡿⠛⠛⠿⢶⣦⣀⠀⢀⣀⣀⣀⣀⣠⡾⠋⠀⠀⠹⣷⣄⣤⣶⡶⠿⠿⣷⡄⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⢰⣿⠁⠀⠀⠀⠀⠈⠙⠛⠛⠋⠉⠉⢹⡟⠁⠀⠀⣀⣀⠘⣿⠉⠀⠀⠀⠀⠘⣿⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠁⠀⠀⣾⡋⣽⠿⠛⠿⢶⣤⣤⣤⣤⣿⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⢸⣿⡴⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⣄⡀⠀⢈⣻⡏⠀⠀⠀⠀⣿⣀⠀⠈⠙⣷⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⣰⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠛⠛⠛⠙⢷⣄⣀⣀⣼⣏⣿⠀⠀⢀⣿⠀⠀⠀⠀
+⠀⠀⠀⠀⢸⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⣿⡉⠉⠁⢀⣠⣿⡇⠀⠀⠀⠀
+⠀⠀⠀⠀⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⠗⠾⠟⠋⢹⣷⠀⠀⠀⠀
+⢀⣤⣤⣤⣿⣤⣄⠀⠀⠀⠴⠚⠲⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣶⡆⠀⠀⠀⠀⢀⣈⣿⣀⣀⡀⠀
+⠀⠀⠀⠈⣿⣠⣾⠟⠛⢷⡄⠀⠀⠀⠀⠀⠀⠀⡤⠶⢦⡀⠀⠀⠀⠀⠹⠯⠃⠀⠀⠀⠈⠉⢩⡿⠉⠉⠉⠁
+⠀⠀⣤⡶⠿⣿⣇⠀⠀⠸⣷⠀⠀⠀⠀⠀⠀⠀⠓⠶⠞⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢤⣼⣯⣀⣀⠀⠀
+⠀⢰⣯⠀⠀⠈⠻⠀⠀⠀⣿⣶⣤⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⡿⠁⠉⠉⠁⠀
+⠀⠀⠙⣷⣄⠀⠀⠀⠀⠀⢀⣀⣀⠙⢿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢈⣿⡿⢷⣄⡀⠀⠀⠀
+⠀⠀⠀⠈⠙⣷⠀⠀⠀⣴⠟⠉⠉⠀⠀⣿⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣠⣤⣾⠟⠉⠀⠀⠈⠉⠀⠀⠀
+⠀⠀⠀⠀⠰⣿⠀⠀⠀⠙⢧⣤⡶⠟⢀⣿⠛⢟⡟⡯⠽⢶⡶⠾⢿⣻⣏⣹⡏⣁⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠹⣷⣄⠀⠀⠀⠀⠀⣠⣾⠏⠀⠀⠙⠛⠛⠋⠀⠀⢀⣽⠟⠛⠖⠛⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠙⠻⠷⠶⠿⠟⠋⠹⣷⣤⣀⡀⠄⣡⣀⣠⣴⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⣍⣉⣻⣏⣉⣡⠞⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+made by vor
 
-# Run
-client.run(token, bot=False)
+$streamer - status says ur streaming
+$streameroff - turns off streaming status
+$streamertext <text> - changes stream text (must have streamer on)
+$autoreact :emoji: - automatically react to all messages with the emoji
+$autoreactoff - disable auto react
+"""
+        await message.channel.send(f'```\n{help_text}\n```')
+
+# Run the client with your token from environment variables
+token = os.getenv('DISCORD_TOKEN')
+if not token:
+    print("Error: DISCORD_TOKEN environment variable is not set.")
+else:
+    client.run(token, bot=False)
